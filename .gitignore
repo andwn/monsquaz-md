@@ -1,0 +1,9 @@
+bin/
+*.o
+*.bin
+*.pat
+*.map
+*.spr
+*.gen
+*.lst
+*.elf

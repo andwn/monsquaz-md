@@ -1,0 +1,2180 @@
+; variable rate sample player Z80 driver
+; it can play a sample (8 bit signed) from 8 Khz up to 32 Khz rate
+; Stephane Dallongeville @2011
+;
+; Z80 clock is 3.547 Mhz on PAL and 3.575 on NTSC
+;
+; we always take pessimist case
+;
+; 32000 Hz : 110 cycles per sample
+; 22050 Hz : 161 cycles per sample
+; 16000 Hz : 221 cycles per sample
+; 13400 Hz : 264 cycles per sample
+; 11025 Hz : 321 cycles per sample
+;  8000 Hz : 443 cycles per sample
+;
+; so we have to do 110 cycles per sample output which consist of :
+; - read 2 samples from ROM and copy it to a temp buffer in RAM (~48 cycles)
+; - output the obtained sample to the DAC (30 cycles)
+; - handle wait for sample rate (18 cycles at least)
+; - handle loop (14 cycles)
+;
+; register usage :
+; SP  = sample source (in ROM)
+; HL  = mix buffer
+; B   = rate
+; HL' = YMPORT0
+; BC' = read buffer
+; D'  = $80 (used for sample unsign)
+
+
+; ###########################      define      ##############################
+
+YMPORT0     EQU     $4000           ; YM2612 port 0
+YMPORT1     EQU     $4001           ; YM2612 port 1
+YMPORT2     EQU     $4002           ; YM2612 port 2
+YMPORT3     EQU     $4003           ; YM2612 port 3
+VDPSTATUS_H EQU     $7F04           ; VDP status port high
+VDPSTATUS_L EQU     $7F05           ; VDP status port low
+VCOUNTER    EQU     $7F08           ; V counter
+HCOUNTER    EQU     $7F09           ; H counter
+PSGPORT     EQU     $7F11           ; PSG port
+BANKREG     EQU     $6000           ; bank register
+
+COMPLAY_SFT EQU     0               ; start play command
+COMSTOP_SFT EQU     4               ; stop play command
+
+STATPLAY_SFT  EQU   0               ; playing status
+STATREADY_SFT EQU   7               ; driver ready status
+
+CH0_SFT     EQU     0               ; channel 0
+CH1_SFT     EQU     1               ; channel 1
+CH2_SFT     EQU     2               ; channel 2
+CH3_SFT     EQU     3               ; channel 3
+
+COMPLAY     EQU     1<<COMPLAY_SFT
+COMSTOP     EQU     1<<COMSTOP_SFT
+
+STATPLAY    EQU     1<<STATPLAY_SFT
+STATREADY   EQU     1<<STATREADY_SFT
+
+CH0         EQU     1<<CH0_SFT
+CH1         EQU     1<<CH1_SFT
+CH2         EQU     1<<CH2_SFT
+CH3         EQU     1<<CH3_SFT
+
+
+; ########################### variable #############################
+
+COMMAND     EQU     $0100           ; command from 68K
+STATUS      EQU     $0102           ; status from Z80
+PARAMS      EQU     $0104           ; parameters (68K and Z80)
+
+WAVADR      EQU     PARAMS+$00      ; WAV address (bit 8 --> bit 23)
+WAVLEN      EQU     PARAMS+$02      ; WAV lenght (bit 8 --> bit 23)
+RATE        EQU     PARAMS+$04      ; rate (0=32000, 1=22050, 2=16000, 3=13400, 4=11025, 5=8000)
+PAN         EQU     PARAMS+$06      ; panning
+
+IWAVADR     EQU     PARAMS+$10      ; internal WAV address (bit 8 --> bit 23)
+IWAVLEN     EQU     PARAMS+$12      ; internal WAV lenght (bit 8 --> bit 23)
+
+NULLWAVADR  EQU     PARAMS+$20      ; silent WAV adr
+NULLWAVLEN  EQU     PARAMS+$22      ; silent WAV len
+
+WRITEBUF    EQU     PARAMS+$24
+READBUF     EQU     PARAMS+$26
+
+WAVBUFFER0  EQU     $1E00           ; WAV buffer 0
+WAVBUFFER1  EQU     $1F00           ; WAV buffer 1
+
+
+; ############################     macro     ##############################
+
+
+; setBank
+; -------
+; A    -> bit 22-15 of rom address to set in the bank register
+; HL  <-  BANKREG
+;
+; set the bank register for ROM area
+; = 101 cycles
+
+            macro   setBank
+
+            LD  HL, BANKREG         ; HL = BANKREG              ' 10
+            LD  (HL), A             ; #1 (bit 15)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #2 (bit 16)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #3 (bit 17)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #4 (bit 18)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #5 (bit 19)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #6 (bit 20)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #7 (bit 21)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #8 (bit 22)               ' 7
+            LD  (HL), L             ; #9 (bit 23 = 0)           ' 7
+
+            endm                    ;                           ' 101
+
+
+; setBankFast
+; -----------
+; A    -> bit 21-15 of rom address to set in the bank register
+; HL  <-  BANKREG
+;
+; set the bank register for ROM area
+; = 97 cycles
+
+            macro   setBankFast
+
+            LD  HL, BANKREG         ; HL = BANKREG              ' 10
+            LD  (HL), A             ; #1 (bit 15)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #2 (bit 16)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #3 (bit 17)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #4 (bit 18)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #5 (bit 19)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #6 (bit 20)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (HL), A             ; #7 (bit 21)               ' 7
+            LD  (HL), L             ; #8 (bit 22 = 0)           ' 7
+            LD  (HL), L             ; #9 (bit 23 = 0)           ' 7
+
+            endm                    ;                           ' 97
+
+
+; setBank_BC
+; ----------
+; A    -> bit 21-15 of rom address to set in the bank register
+; BC  <-  BANKREG
+; A   <-  0
+;
+; set the bank register for ROM area
+; = 101 cycles
+
+            macro   setBank_BC
+
+            LD  BC, BANKREG         ; BC = BANKREG              ' 10
+            LD  (BC), A             ; #1 (bit 15)               ' 7
+            RRCA                    ;                           ' 4
+            LD  (BC), A             ; #2 (bit 16)               ' 7
+            RRCA                    ;                           ' 4
+            LD  (BC), A             ; #3 (bit 17)               ' 7
+            RRCA                    ;                           ' 4
+            LD  (BC), A             ; #4 (bit 18)               ' 7
+            RRCA                    ;                           ' 4
+            LD  (BC), A             ; #5 (bit 19)               ' 7
+            RRCA                    ;                           ' 4
+            LD  (BC), A             ; #6 (bit 20)               ' 7
+            RRCA                    ;                           ' 4
+            LD  (BC), A             ; #7 (bit 21)               ' 7
+            XOR A                   ;                           ' 4
+            LD  (BC), A             ; #8 (bit 22 = 0)           ' 7
+            LD  (BC), A             ; #9 (bit 23 = 0)           ' 7
+
+            endm                    ;                           ' 101
+
+
+; setBank_DE
+; ----------
+; A    -> bit 22-15 of rom address to set in the bank register
+; DE  <-  BANKREG
+; A   <-  0
+;
+; set the bank register for ROM area
+; = 105 cycles
+
+            macro   setBank_DE
+
+            LD  DE, BANKREG         ; DE = BANKREG              ' 10
+            LD  (DE), A             ; #1 (bit 15)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #2 (bit 16)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #3 (bit 17)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #4 (bit 18)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #5 (bit 19)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #6 (bit 20)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #7 (bit 21)               ' 7
+            RRCA                     ;                          ' 4
+            LD  (DE), A             ; #8 (bit 22)               ' 7
+            XOR A                    ;                          ' 4
+            LD  (DE), A             ; #9 (bit 23 = 0)           ' 7
+
+            endm                    ;                           ' 105
+
+
+; writeYMFast
+; -----------
+; HL  <-> YM port where to write
+; D    -> address
+; E    -> value
+;
+; write to YM2612 (no busy check)
+; = 18 cycles
+
+            macro   writeYMFast
+
+            LD      (HL), D         ; write address             ' 7     |
+            INC     L               ; next port                 ' 4     | 18
+            LD      (HL), E         ; write value               ' 7     |
+
+            endm
+
+
+
+; getPlayCommand
+; --------------
+; HL  <-  point to COMMAND
+; zf  <-  channel 'ch' play command
+;
+; Z flag reset if play command for channel 'ch'
+; = 22 cycles
+
+            macro   getPlayCommand ch
+
+            LD      HL, COMMAND             ;                   ' 10
+            BIT     COMPLAY_SFT+ch, (HL)    ; play command ?    ' 12
+
+            endm                            ;                   ' 22
+
+
+; getStopCommand
+; --------------
+; HL  <-  point to COMMAND
+; zf  <-  channel 'ch' stop command
+;
+; Z flag reset if stop command for channel 'ch'
+; = 22 cycles
+
+            macro   getStopCommand ch
+
+            LD      HL, COMMAND             ;                   ' 10
+            BIT     COMSTOP_SFT+ch, (HL)    ; stop command ?    ' 12
+
+            endm                            ;                   ' 22
+
+
+; setPlayCommand
+; ----------------
+; HL  <-  point to COMMAND
+;
+; set the play command for channel 'ch'
+; = 25 cycles
+
+            macro   setPlayCommand ch
+
+            LD      HL, COMMAND             ;                   ' 10
+            SET     COMPLAY_SFT+ch, (HL)    ; set command       ' 15
+
+            endm                            ;                   ' 25
+
+
+; setStopCommand
+; ----------------
+; HL  <-  point to COMMAND
+;
+; set the stop command for channel 'ch'
+; = 25 cycles
+
+            macro   setStopCommand ch
+
+            LD      HL, COMMAND             ;                   ' 10
+            SET     COMSTOP_SFT+ch, (HL)    ; set command       ' 15
+
+            endm                            ;                   ' 25
+
+
+; clearPlayCommand
+; ----------------
+; HL  <-  point to COMMAND
+;
+; clear the play command for channel 'ch'
+; = 25 cycles
+
+            macro   clearPlayCommand ch
+
+            LD      HL, COMMAND             ;                   ' 10
+            RES     COMPLAY_SFT+ch, (HL)    ; clear command     ' 15
+
+            endm                            ;                   ' 25
+
+
+; clearStopCommand
+; ----------------
+; HL  <-  point to COMMAND
+;
+; clear the stop command for channel 'ch'
+; = 25 cycles
+
+            macro   clearStopCommand ch
+
+            LD      HL, COMMAND             ;                   ' 10
+            RES     COMSTOP_SFT+ch, (HL)    ; clear command     ' 15
+
+            endm                            ;                   ' 25
+
+
+; getPlayStatus
+; -------------
+; HL  <- point to STATUS
+; zf  <-  channel 'ch' is playing
+;
+; Z flag reset if play status for channel 'ch'
+; = 22 cycles
+
+            macro   getPlayStatus ch
+
+            LD      HL, STATUS              ;                   ' 10
+            BIT     STATPLAY_SFT+ch, (HL)   ; get status        ' 12
+
+            endm                            ;                   ' 22
+
+
+; setPlayStatus
+; -------------
+; HL  <- point to STATUS
+;
+; set the play status for channel 'ch'
+; = 25 cycles
+
+            macro   setPlayStatus ch
+
+            LD      HL, STATUS              ;                   ' 10
+            SET     STATPLAY_SFT+ch, (HL)   ; set status        ' 15
+
+            endm                            ;                   ' 25
+
+
+; clearPlayStatus
+; ---------------
+; HL  <- point to STATUS
+;
+; clear play status for channel 'ch'
+; = 25 cycles
+
+            macro   clearPlayStatus ch
+
+            LD      HL, STATUS              ;                   ' 10
+            RES     STATPLAY_SFT+ch, (HL)   ; clear status      ' 15
+
+            endm                            ;                   ' 25
+
+
+; getLoopStatus
+; -------------
+; HL  <- point to STATUS+1
+; zf  <-  channel 'ch' is playing
+;
+; Z flag reset if loop status for channel 'ch'
+; = 22 cycles
+
+            macro   getLoopStatus ch
+
+            LD      HL, STATUS+1            ;                   ' 10
+            BIT     STATPLAY_SFT+ch, (HL)   ; get status        ' 12
+
+            endm                            ;                   ' 22
+
+
+; setLoopStatus
+; -------------
+; HL  <- point to STATUS+1
+;
+; set the loop status for channel 'ch'
+; = 25 cycles
+
+            macro   setLoopStatus ch
+
+            LD      HL, STATUS+1            ;                   ' 10
+            SET     STATPLAY_SFT+ch, (HL)   ; set status        ' 15
+
+            endm                            ;                   ' 25
+
+
+; clearLoopStatus
+; ---------------
+; HL  <- point to STATUS+1
+;
+; clear loop status for channel 'ch'
+; = 25 cycles
+
+            macro   clearLoopStatus ch
+
+            LD      HL, STATUS+1            ;                   ' 10
+            RES     STATPLAY_SFT+ch, (HL)   ; clear status      ' 15
+
+            endm                            ;                   ' 25
+
+
+; clearAllStatus
+; --------------
+; HL  <- 0
+;
+; clear play and loop status for all channel
+; = 26 cycles
+
+            macro   clearAllStatus
+
+            LD      HL, $00                 ;                   ' 10
+            LD      (STATUS), HL            ; clear status      ' 16
+
+            endm                            ;                   ' 26
+
+
+; ############################  macro wait macro  ##############################
+
+
+; wait2p16x
+; ---------
+; wait for ((w * 16) + 2) cycles
+;
+            macro   wait2p16x w
+
+            LD      A, w            ; 7-2
+.loop
+            DEC     A               ; 4
+            JR      NZ, .loop       ; 12
+
+            endm
+
+
+            macro   wait4
+            NOP
+            endm
+
+            macro   wait6
+            INC     DE
+            endm
+
+            macro   wait7
+            OR      $0
+            endm
+
+            macro   wait8
+            wait4
+            wait4
+            endm
+
+            macro   wait9
+            LD      R, A
+            endm
+
+            macro   wait10
+            JP      .go
+.go
+            endm
+
+            macro   wait11
+            wait7
+            wait4
+            endm
+
+            macro   wait12
+            JR      .go
+.go
+            endm
+
+            macro   wait13
+            wait9
+            wait4
+            endm
+
+            macro   wait14
+            wait7
+            wait7
+            endm
+
+            macro   wait15
+            wait8
+            wait7
+            endm
+
+            macro   wait16
+            wait12
+            wait4
+            endm
+
+            macro   wait17
+            wait10
+            wait7
+            endm
+
+            macro   wait18
+            wait9
+            wait9
+            endm
+
+            macro   wait19
+            wait12
+            wait7
+            endm
+
+            macro   wait20
+            wait11
+            wait9
+            endm
+
+            macro   wait21
+            wait12
+            wait9
+            endm
+
+            macro   wait22
+            wait18
+            wait4
+            endm
+
+            macro   wait23
+            wait14
+            wait9
+            endm
+
+            macro   wait24
+            wait12
+            wait12
+            endm
+
+            macro   wait25
+            wait21
+            wait4
+            endm
+
+            macro   wait26
+            wait18
+            wait8
+            endm
+
+            macro   wait27
+            wait18
+            wait9
+            endm
+
+            macro   wait28
+            wait21
+            wait7
+            endm
+
+            macro   wait29
+            wait21
+            wait8
+            endm
+
+            macro   wait30
+            wait21
+            wait9
+            endm
+
+            macro   wait31
+            wait21
+            wait10
+            endm
+
+            macro   wait32
+            wait20
+            wait12
+            endm
+
+            macro   wait33
+            wait21
+            wait12
+            endm
+
+            macro   wait34
+            wait2p16x 2
+            endm
+
+            macro   wait35
+            wait28
+            wait7
+            endm
+
+            macro   wait36
+            wait27
+            wait9
+            endm
+
+            macro   wait37
+            wait28
+            wait9
+            endm
+
+            macro   wait38
+            wait24
+            wait14
+            endm
+
+            macro   wait39
+            wait27
+            wait12
+            endm
+
+            macro   wait40
+            wait27
+            wait13
+            endm
+
+            macro   wait41
+            wait34
+            wait7
+            endm
+
+            macro   wait42
+            wait34
+            wait8
+            endm
+
+            macro   wait43
+            wait36
+            wait7
+            endm
+
+            macro   wait44
+            wait34
+            wait10
+            endm
+
+            macro   wait45
+            wait36
+            wait9
+            endm
+
+            macro   wait46
+            wait34
+            wait12
+            endm
+
+            macro   wait47
+            wait34
+            wait13
+            endm
+
+            macro   wait48
+            wait36
+            wait12
+            endm
+
+            macro   wait49
+            wait36
+            wait13
+            endm
+
+            macro   wait50
+            wait2p16x 3
+            endm
+
+            macro   wait51
+            wait34
+            wait17
+            endm
+
+            macro   wait52
+            wait34
+            wait18
+            endm
+
+            macro   wait53
+            wait36
+            wait17
+            endm
+
+            macro   wait54
+            wait50
+            wait4
+            endm
+
+            macro   wait55
+            wait34
+            wait21
+            endm
+
+            macro   wait56
+            wait34
+            wait22
+            endm
+
+            macro   wait57
+            wait50
+            wait7
+            endm
+
+            macro   wait58
+            wait50
+            wait8
+            endm
+
+            macro   wait59
+            wait50
+            wait9
+            endm
+
+            macro   wait60
+            wait50
+            wait10
+            endm
+
+            macro   wait61
+            wait50
+            wait11
+            endm
+
+            macro   wait62
+            wait50
+            wait12
+            endm
+
+            macro   wait63
+            wait50
+            wait13
+            endm
+
+            macro   wait64
+            wait50
+            wait14
+            endm
+
+            macro   wait65
+            wait50
+            wait15
+            endm
+
+            macro   wait66
+            wait2p16x 4
+            endm
+
+            macro   wait67
+            wait50
+            wait17
+            endm
+
+            macro   wait68
+            wait50
+            wait18
+            endm
+
+            macro   wait69
+            wait50
+            wait19
+            endm
+
+            macro   wait70
+            wait66
+            wait4
+            endm
+
+            macro   wait71
+            wait50
+            wait21
+            endm
+
+            macro   wait72
+            wait50
+            wait22
+            endm
+
+            macro   wait73
+            wait66
+            wait7
+            endm
+
+            macro   wait74
+            wait66
+            wait8
+            endm
+
+            macro   wait75
+            wait66
+            wait9
+            endm
+
+            macro   wait76
+            wait66
+            wait10
+            endm
+
+            macro   wait77
+            wait66
+            wait11
+            endm
+
+            macro   wait78
+            wait66
+            wait12
+            endm
+
+            macro   wait79
+            wait66
+            wait13
+            endm
+
+            macro   wait80
+            wait66
+            wait14
+            endm
+
+            macro   wait81
+            wait66
+            wait15
+            endm
+
+            macro   wait82
+            wait2p16x 5
+            endm
+
+            macro   wait83
+            wait66
+            wait17
+            endm
+
+            macro   wait84
+            wait66
+            wait18
+            endm
+
+            macro   wait85
+            wait66
+            wait19
+            endm
+
+            macro   wait86
+            wait82
+            wait4
+            endm
+
+            macro   wait87
+            wait66
+            wait21
+            endm
+
+            macro   wait88
+            wait66
+            wait22
+            endm
+
+            macro   wait89
+            wait82
+            wait7
+            endm
+
+            macro   wait90
+            wait82
+            wait8
+            endm
+
+            macro   wait91
+            wait82
+            wait9
+            endm
+
+            macro   wait92
+            wait82
+            wait10
+            endm
+
+            macro   wait94
+            wait82
+            wait12
+            endm
+
+            macro   wait95
+            wait82
+            wait13
+            endm
+
+            macro   wait96
+            wait82
+            wait14
+            endm
+
+            macro   wait97
+            wait82
+            wait15
+            endm
+
+            macro   wait98
+            wait2p16x 6
+            endm
+
+            macro   wait99
+            wait82
+            wait17
+            endm
+
+            macro   wait100
+            wait82
+            wait18
+            endm
+
+            macro   wait102
+            wait98
+            wait4
+            endm
+
+            macro   wait103
+            wait82
+            wait21
+            endm
+
+            macro   wait104
+            wait82
+            wait22
+            endm
+
+            macro   wait105
+            wait98
+            wait7
+            endm
+
+            macro   wait106
+            wait98
+            wait8
+            endm
+
+            macro   wait107
+            wait98
+            wait9
+            endm
+
+            macro   wait108
+            wait98
+            wait10
+            endm
+
+            macro   wait109
+            wait98
+            wait11
+            endm
+
+            macro   wait110
+            wait98
+            wait12
+            endm
+
+            macro   wait111
+            wait98
+            wait13
+            endm
+
+            macro   wait112
+            wait98
+            wait14
+            endm
+
+            macro   wait114
+            wait2p16x 7
+            endm
+
+            macro   wait115
+            wait98
+            wait17
+            endm
+
+            macro   wait116
+            wait98
+            wait18
+            endm
+
+            macro   wait117
+            wait98
+            wait19
+            endm
+
+            macro   wait118
+            wait114
+            wait4
+            endm
+
+            macro   wait119
+            wait98
+            wait21
+            endm
+
+            macro   wait120
+            wait98
+            wait22
+            endm
+
+            macro   wait121
+            wait114
+            wait7
+            endm
+
+            macro   wait122
+            wait114
+            wait8
+            endm
+
+            macro   wait123
+            wait114
+            wait9
+            endm
+
+            macro   wait124
+            wait114
+            wait10
+            endm
+
+            macro   wait125
+            wait114
+            wait11
+            endm
+
+            macro   wait126
+            wait114
+            wait12
+            endm
+
+            macro   wait127
+            wait114
+            wait13
+            endm
+
+            macro   wait128
+            wait114
+            wait14
+            endm
+
+            macro   wait129
+            wait114
+            wait15
+            endm
+
+            macro   wait130
+            wait2p16x 8
+            endm
+
+            macro   wait131
+            wait114
+            wait17
+            endm
+
+            macro   wait132
+            wait114
+            wait18
+            endm
+
+            macro   wait133
+            wait114
+            wait19
+            endm
+
+            macro   wait134
+            wait130
+            wait4
+            endm
+
+            macro   wait135
+            wait114
+            wait21
+            endm
+
+            macro   wait136
+            wait114
+            wait22
+            endm
+
+            macro   wait137
+            wait130
+            wait7
+            endm
+
+            macro   wait138
+            wait130
+            wait8
+            endm
+
+            macro   wait139
+            wait130
+            wait9
+            endm
+
+            macro   wait140
+            wait130
+            wait10
+            endm
+
+            macro   wait141
+            wait130
+            wait11
+            endm
+
+            macro   wait144
+            wait130
+            wait14
+            endm
+
+            macro   wait145
+            wait130
+            wait15
+            endm
+
+            macro   wait146
+            wait2p16x 9
+            endm
+
+            macro   wait147
+            wait130
+            wait17
+            endm
+
+            macro   wait148
+            wait130
+            wait18
+            endm
+
+            macro   wait149
+            wait130
+            wait19
+            endm
+
+            macro   wait150
+            wait146
+            wait4
+            endm
+
+            macro   wait154
+            wait146
+            wait8
+            endm
+
+            macro   wait155
+            wait146
+            wait9
+            endm
+
+            macro   wait156
+            wait146
+            wait10
+            endm
+
+            macro   wait157
+            wait146
+            wait11
+            endm
+
+            macro   wait158
+            wait146
+            wait12
+            endm
+
+            macro   wait160
+            wait146
+            wait14
+            endm
+
+            macro   wait161
+            wait146
+            wait15
+            endm
+
+            macro   wait162
+            wait2p16x 10
+            endm
+
+            macro   wait164
+            wait146
+            wait18
+            endm
+
+            macro   wait165
+            wait146
+            wait19
+            endm
+
+            macro   wait166
+            wait162
+            wait4
+            endm
+
+            macro   wait172
+            wait162
+            wait10
+            endm
+
+            macro   wait174
+            wait162
+            wait12
+            endm
+
+            macro   wait175
+            wait162
+            wait13
+            endm
+
+            macro   wait176
+            wait162
+            wait14
+            endm
+
+            macro   wait178
+            wait2p16x 11
+            endm
+
+            macro   wait179
+            wait162
+            wait17
+            endm
+
+            macro   wait180
+            wait162
+            wait18
+            endm
+
+            macro   wait182
+            wait178
+            wait4
+            endm
+
+            macro   wait183
+            wait162
+            wait121
+            endm
+
+            macro   wait186
+            wait178
+            wait8
+            endm
+
+            macro   wait187
+            wait178
+            wait9
+            endm
+
+            macro   wait189
+            wait178
+            wait11
+            endm
+
+            macro   wait191
+            wait178
+            wait13
+            endm
+
+            macro   wait192
+            wait178
+            wait14
+            endm
+
+            macro   wait193
+            wait178
+            wait15
+            endm
+
+            macro   wait194
+            wait2p16x 12
+            endm
+
+            macro   wait197
+            wait178
+            wait19
+            endm
+
+            macro   wait203
+            wait194
+            wait9
+            endm
+
+            macro   wait210
+            wait2p16x 13
+            endm
+
+            macro   wait218
+            wait210
+            wait8
+            endm
+
+            macro   wait226
+            wait2p16x 14
+            endm
+
+            macro   wait234
+            wait226
+            wait8
+            endm
+
+            macro   wait242
+            wait2p16x 15
+            endm
+
+            macro   wait244
+            wait226
+            wait18
+            endm
+
+            macro   wait246
+            wait242
+            wait4
+            endm
+
+            macro   wait254
+            wait242
+            wait12
+            endm
+
+            macro   wait258
+            wait2p16x 16
+            endm
+
+            macro   wait260
+            wait242
+            wait18
+            endm
+
+            macro   wait262
+            wait258
+            wait4
+            endm
+
+            macro   wait264
+            wait242
+            wait22
+            endm
+
+            macro   wait268
+            wait258
+            wait10
+            endm
+
+            macro   wait274
+            wait2p16x 17
+            endm
+
+            macro   wait276
+            wait258
+            wait18
+            endm
+
+            macro   wait278
+            wait274
+            wait4
+            endm
+
+            macro   wait282
+            wait274
+            wait8
+            endm
+
+            macro   wait283
+            wait274
+            wait9
+            endm
+
+            macro   wait285
+            wait274
+            wait11
+            endm
+
+            macro   wait287
+            wait274
+            wait13
+            endm
+
+            macro   wait290
+            wait2p16x 18
+            endm
+
+            macro   wait294
+            wait290
+            wait4
+            endm
+
+            macro   wait295
+            wait274
+            wait21
+            endm
+
+            macro   wait298
+            wait290
+            wait8
+            endm
+
+            macro   wait305
+            wait290
+            wait15
+            endm
+
+            macro   wait306
+            wait2p16x 19
+            endm
+
+            macro   wait308
+            wait290
+            wait18
+            endm
+
+            macro   wait320
+            wait306
+            wait14
+            endm
+
+            macro   wait322
+            wait2p16x 20
+            endm
+
+            macro   wait324
+            wait306
+            wait18
+            endm
+
+            macro   wait329
+            wait322
+            wait7
+            endm
+
+            macro   wait337
+            wait322
+            wait15
+            endm
+
+            macro   wait338
+            wait2p16x 21
+            endm
+
+            macro   wait345
+            wait338
+            wait7
+            endm
+
+            macro   wait434
+            wait2p16x 27
+            endm
+
+            macro   wait450
+            wait2p16x 28
+            endm
+
+            macro   wait454
+            wait450
+            wait4
+            endm
+
+            macro   wait455
+            wait434
+            wait21
+            endm
+
+            macro   wait546
+            wait2p16x 34
+            endm
+
+            macro   wait562
+            wait2p16x 35
+            endm
+
+            macro   wait567
+            wait546
+            wait21
+            endm
+
+            macro   wait578
+            wait2p16x 36
+            endm
+
+            macro   wait586
+            wait578
+            wait8
+            endm
+
+            macro   wait590
+            wait578
+            wait12
+            endm
+
+            macro   wait594
+            wait2p16x 37
+            endm
+
+            macro   wait595
+            wait578
+            wait17
+            endm
+
+            macro   wait598
+            wait594
+            wait4
+            endm
+
+            macro   wait599
+            wait578
+            wait21
+            endm
+
+            macro   wait602
+            wait594
+            wait8
+            endm
+
+            macro   wait609
+            wait594
+            wait15
+            endm
+
+            macro   wait610
+            wait2p16x 38
+            endm
+
+            macro   wait614
+            wait610
+            wait4
+            endm
+
+            macro   wait618
+            wait610
+            wait8
+            endm
+
+            macro   wait619
+            wait610
+            wait9
+            endm
+
+            macro   wait622
+            wait610
+            wait12
+            endm
+
+            macro   wait623
+            wait610
+            wait13
+            endm
+
+            macro   wait626
+            wait2p16x 39
+            endm
+
+            macro   wait634
+            wait626
+            wait8
+            endm
+
+            macro   wait638
+            wait626
+            wait12
+            endm
+
+
+; doWaitForRate
+; -------------
+; B    -> rate
+; A   <-  ?
+;
+; wait the necessary number of cycle depending the sample rate
+; = 18 --> 351 cycles
+
+            macro doWaitForRate
+
+            LD      A, B                    ;                   ' 4     |
+            OR      A                       ;                   ' 4     | 18
+            JP      Z, .end_wait            ;                   ' 10    |
+
+            wait30                          ;                   ' 30    |
+            LD      A, B                    ;                   ' 4     | 51 (69)
+            CP      A, 1                    ;                   ' 7     |
+            JP      Z, .end_wait            ;                   ' 10    |
+
+            wait39                          ;                   ' 39    |
+            LD      A, B                    ;                   ' 4     | 60 (129)
+            CP      A, 2                    ;                   ' 7     |
+            JP      Z, .end_wait            ;                   ' 10    |
+
+            wait22                          ;                   ' 22    |
+            LD      A, B                    ;                   ' 4     | 43 (172)
+            CP      A, 3                    ;                   ' 7     |
+            JP      Z, .end_wait            ;                   ' 10    |
+
+            wait36                          ;                   ' 36    |
+            LD      A, B                    ;                   ' 4     | 57 (229)
+            CP      A, 4                    ;                   ' 7     |
+            JP      Z, .end_wait            ;                   ' 10    |
+
+            wait122                         ;                   ' 122 (351)
+
+.end_wait
+
+            endm                            ;                   ' 18 --> 351
+
+
+; copyChannelParams
+; -----------------
+; copy channel parameters to internal structure
+; = 64 cycles
+
+            macro copyChannelParams
+
+            LD      HL, (WAVADR)            ;                   ' 16
+            LD      (IWAVADR), HL           ;                   ' 16
+            LD      HL, (WAVLEN)            ;                   ' 16
+            LD      (IWAVLEN), HL           ;                   ' 16
+
+            endm                            ;                   ' 64
+
+; setNullWav
+; ----------
+; set null sample play
+; = 64 cycles
+
+            macro setNullWav
+
+            LD      HL, (NULLWAVADR)        ;                   ' 16
+            LD      (IWAVADR), HL           ;                   ' 16
+            LD      HL, (NULLWAVLEN)        ;                   ' 16
+            LD      (IWAVLEN), HL           ;                   ' 16
+
+            endm                            ;                   ' 64
+
+
+; clearPlayAndLoopStatus
+; ----------------------
+; clear play and loop status flag
+; = 50 cycles
+
+            macro clearPlayAndLoopStatus
+
+            clearPlayStatus 0               ; clear play status ' 25
+            clearLoopStatus 0               ; clear loop status ' 25
+
+            endm                            ;                   ' 50
+
+
+; stopChannel
+; -----------
+; set null sample play
+; = 114 cycles
+
+            macro stopChannel
+
+            setNullWav                      ;                   ' 64
+            clearPlayAndLoopStatus          ;                   ' 50
+
+            endm                            ;                   ' 114
+
+
+; handlePlayCommandWhilePlay4
+; ---------------------------
+; HL  <-  ?
+; DE  <-  ?
+;
+; handle play command while play 4 samples
+; = 440 cycles
+
+            macro handlePlayCommandWhilePlay4
+
+            sampleOutputAndWait     ; (0*110)+0 --> perfect     ' 48 (48)
+
+            getPlayCommand 0            ; play command ?        ' 22    | 32 (80)
+            JP      NZ, .do_command     ;                       ' 10    |
+
+            wait30                  ; synchro                   ' 30 (110)
+
+            sampleOutputAndWait     ; (1*110)+0 --> perfect     ' 48 (158)
+
+            wait62                  ; synchro                   ' 62 (220)
+
+            sampleOutputAndWait     ; (2*110)+0 --> perfect     ' 48 (268)
+
+            wait62                  ; synchro                   ' 62 (330)
+
+            sampleOutputAndWait     ; (3*110)+0 --> perfect     ' 48 (378)
+
+            wait52                  ;                           ' 52    | 62 (440)
+            JP      .end            ;                           ' 10    |
+
+.do_command
+            clearPlayCommand 0      ; clear play command        ' 25    | 29 (109)
+            wait4                   ; synchro                   ' 4     |
+
+            sampleOutputAndWait     ; (1*110)-1 --> bit soon    ' 48 (157)
+
+            copyChannelParams       ; copy params               ' 64 (221)
+
+            sampleOutputAndWait     ; (2*110)+1 --> bit late    ' 48 (269)
+
+            setPlayStatus 0         ; set play status           ' 25    |
+            LD      A, (RATE)       ; get rate value            ' 13    |
+            LD      B, A            ; store in B                ' 4     | 59 (328)
+            LD      A, (PAN)        ; set pan value             ' 13    |
+            LD      C, A            ; store in C                ' 4     |
+
+            sampleOutputAndWait     ; (3*110)-2 --> soon        ' 48 (376)
+
+            LD      HL, YMPORT2     ; prepare panning           ' 10    |
+            LD      (HL), $B6       ;                           ' 10    |
+            INC     L               ;                           ' 4     |
+            wait11                  ;                           ' 11    |
+            LD      (HL), C         ; set pan value             ' 7     | 64 (440)
+            DEC     L               ;                           ' 4     |
+            DEC     L               ;                           ' 4     |
+            DEC     L               ;                           ' 4     |
+            LD      (HL), $2A       ; prepare DAC out           ' 10    |
+
+.end
+            endm                    ;                           ' 440
+
+
+; prepareChannelWhilePlay4
+; ------------------------
+; SP  <-  point to the sample source
+; HL  <-  point to write buffer
+; A   <-  ?
+; E   <-  ?
+;
+; set bank and prepare registers to play channel
+; = 402 cycles
+
+            macro prepareChannelWhilePlay4
+
+            sampleOutputAndWait     ; (0*110)+0 --> perfect     ' 48 (48)
+
+            LD      HL, IWAVADR     ; point to sample adr       ' 10    |
+            LD      E, (HL)         ; E = bit 8-15              ' 7     |
+            LD      A, E            ; A = bit 8-15              ' 4     |
+            INC     L               ;                           ' 4     | 40 (88)
+            RLA                     ; C flag = bit 15           ' 4     |
+            LD      A, (HL)         ; A = bit 16-23             ' 7     |
+            RLA                     ; A = bit 15-22             ' 4     |
+
+            LD      HL, BANKREG     ; HL = BANKREG              ' 10    |
+            EX      AF, AF'         ; save A                    ' 4     | 22 (110)
+            wait8                   ; synchro                   ' 8     |
+
+            sampleOutputAndWait     ; (1*110)+0 --> perfect     ' 48 (158)
+
+            EX      AF, AF'         ; restore A                 ' 4     |
+            LD      (HL), A         ; #1 (bit 15)               ' 7     |
+            RRA                     ;                           ' 4     |
+            LD      (HL), A         ; #2 (bit 16)               ' 7     |
+            RRA                     ;                           ' 4     |
+            LD      (HL), A         ; #3 (bit 17)               ' 7     | 63 (221)
+            RRA                     ;                           ' 4     |
+            LD      (HL), A         ; #4 (bit 18)               ' 7     |
+            RRA                     ;                           ' 4     |
+            LD      (HL), A         ; #5 (bit 19)               ' 7     |
+            EX      AF, AF'         ; save A                    ' 4     |
+            wait4                   ; synchro                   ' 4     |
+
+            sampleOutputAndWait     ; (2*110)+1 --> bit late    ' 48 (269)
+
+            EX      AF, AF'         ; restore A                 ' 4     |
+            RRA                     ;                           ' 4     |
+            LD      (HL), A         ; #6 (bit 20)               ' 7     |
+            RRA                     ;                           ' 4     | 40 (309)
+            LD      (HL), A         ; #7 (bit 21)               ' 7     |
+            LD      (HL), L         ; #8 (bit 22 = 0)           ' 7     |
+            LD      (HL), L         ; #9 (bit 23 = 0)           ' 7     |
+
+            LD      A, E            ; A = bit 8-15              ' 4     |
+            OR      $80             ; A = $80 | bit 8-14        ' 7     |
+            LD      H, A            ;                           ' 4     | 23 (332)
+            XOR     A               ;                           ' 4     |
+            LD      L, A            ; L = $00                   ' 4     |
+
+            sampleOutputAndWait     ; (3*110)+2 --> late        ' 48 (380)
+
+            LD      SP, HL          ; SP = sample src           ' 6     | 22 (402)
+            LD      HL, (WRITEBUF)  ;                           ' 16    |
+
+            endm                    ;                           ' 402
+
+
+; updateChannelDataWhilePlay2
+; ---------------------------
+; HL  <-  ?
+;
+; update sample address and sample lenght
+; = 180 cycles
+
+            macro updateChannelDataWhilePlay2
+
+            sampleOutputAndWait     ; (0*110)+0 --> perfect     ' 48 (48)
+
+            LD      HL, (IWAVADR)   ; increment address         ' 16    |
+            INC     HL              ;                           ' 6     | 38 (86)
+            LD      (IWAVADR), HL   ;                           ' 16    |
+
+            LD      HL, (IWAVLEN)   ; decrement lenght          ' 16    | 24 (110)
+            wait8                   ; synchro                   ' 8     |
+
+            sampleOutputAndWait     ; (1*110)+0 --> perfect     ' 48 (158)
+
+            DEC     HL              ;                           ' 6     | 22
+            LD      (IWAVLEN), HL   ;                           ' 16    | (180)
+
+            endm                    ; 180
+
+; checkChannelEndWhilePlay4
+; -------------------------
+; HL  <-  ?
+; A   <-  ?
+;
+; check is sample is done, restart it if needed
+; = 430 cycles
+
+            macro checkChannelEndWhilePlay4
+
+            sampleOutputAndWait     ; (0*110)+0 --> perfect     ' 48 (48)
+
+            LD      HL, (IWAVLEN)   ; get sample lenght         ' 16    |
+            LD      A, H            ;                           ' 4     | 34 (82)
+            OR      L               ;                           ' 4     |
+            JP      Z, .done        ; sample done ?             ' 10    |
+
+            wait28                  ; synchro                   ' 28 (110)
+
+            sampleOutputAndWait     ; (1*110)+0 --> perfect     ' 48 (158)
+
+            wait62                  ; synchro                   ' 62 (220)
+
+            sampleOutputAndWait     ; (2*110)+0 --> perfect     ' 48 (268)
+
+            wait62                  ; synchro                   ' 62 (330)
+
+            sampleOutputAndWait     ; (3*110)+0 --> perfect     ' 48 (378)
+
+            wait42                  ;                           ' 42    | 52 (430)
+            JP      .end            ;                           ' 10    |
+
+.done
+            wait28                  ; synchro                   ' 28 (110)
+
+            sampleOutputAndWait     ; (1*110)+0 --> perfect     ' 48 (158)
+
+            getLoopStatus 0         ; loop play ?               ' 22    | 32 (190)
+            JP      Z, .stop        ;                           ' 10    |
+
+            wait30                  ; synchro                   ' 30 (220)
+
+            sampleOutputAndWait     ; (2*110)+0 --> perfect     ' 48 (268)
+
+            copyChannelParams       ; recopy channel param      ' 64 (332)
+
+            sampleOutputAndWait     ; (3*110)+2 --> late        ' 48 (380)
+
+            wait40                  ;                           ' 40    | 50 (430)
+            JP      .end            ;                           ' 10    |
+
+.stop
+            wait30                  ; synchro                   ' 30 (220)
+
+            sampleOutputAndWait     ; (2*110)+0 --> perfect     ' 48 (268)
+
+            setNullWav              ;                           ' 64 (332)
+
+            sampleOutputAndWait     ; (3*110)+2 --> late        ' 48 (380)
+
+            clearPlayAndLoopStatus  ;                           ' 50 (430)
+
+.end
+            endm                    ;                           ' 430
+
+
+; swapBufferWhilePlay2
+; --------------------
+; HL  <-  point to new write buffer
+; DE  <-  point to new read buffer
+;
+; switch read and write buffer
+; = 174 cycles
+
+            macro swapBufferWhilePlay2
+
+            sampleOutputAndWait     ; (0*110)+0 --> perfect     ' 48 (48)
+
+            LD      HL, (WRITEBUF)  ;                           ' 16    |
+            LD      DE, (READBUF)   ;                           ' 20    | 62 (110)
+            LD      (WRITEBUF), DE  ;                           ' 20    |
+            wait6                   ; (can use it here)         ' 6     |
+
+            sampleOutputAndWait     ; (1*110)+0 --> perfect     ' 48 (158)
+
+            LD      (READBUF), HL   ;                           ' 16 (174)
+
+            endm                    ;                           ' 174
+
+
+; sampleOutput
+; ------------
+; HL'  -> YMPORT1
+; BC' <-> point to play output buffer
+; D'   -> $80
+;
+; output a sample to the DAC
+; = 30 cycles
+
+            macro sampleOutput
+
+            EXX                     ;                           ' 4
+            LD      A, (BC)         ; read sample from buffer   ' 7
+            ADD     D               ; unsign                    ' 4
+            INC     C               ; increment with looping    ' 4
+            LD      (HL), A         ; play sample               ' 7
+            EXX                     ;                           ' 4
+
+            endm                    ;                           ' 30
+
+
+; sampleOutputAndWait
+; -------------------
+; HL'  -> YMPORT1
+; BC' <-> point to play output buffer
+; D'   -> $80
+; B    -> rate
+;
+; output a sample to the DAC and wait for ajusting to current sample rate
+; = 48 --> 381 cycles
+
+            macro sampleOutputAndWait
+
+            sampleOutput            ;                           ' 30
+            doWaitForRate           ;                           ' 18 --> 351
+
+            endm                    ;                           ' 48 --> 381
+
+
+; readAndWrite2
+; -------------
+; SP  <-> point to the sample source (ROM)
+; HL  <-> point to the write output buffer
+; DE  <-  ?
+;
+; read 2 samples and write them in output buffer
+; = 34 cycles
+
+            macro readAndWrite2
+
+            POP     DE              ; read 2 samples from ROM   ' 10+2 (rom access latency)
+            LD      (HL), E         ;                           ' 7
+            INC     L               ;                           ' 4
+            LD      (HL), D         ;                           ' 7
+            INC     L               ;                           ' 4
+
+            endm                    ;                           ' 34
+
+
+; ###########################       init       ##############################
+
+            ORG     $0000
+
+init
+            DI                      ; disable ints
+            LD      SP, $2000       ; setup stack
+            IM      $01             ; set int mode 1
+            XOR     A
+            LD      (STATUS), A     ; driver not ready
+            LD      (COMMAND), A    ; command cleared
+            JP      start           ; jump to start
+
+
+; ###########################     interrupt    ##############################
+
+            BLOCK   $0038-$
+
+interrupt                           ; do nothing in this program
+            RETI
+
+
+; ###########################       main       ##############################
+
+            BLOCK   $0200-$
+
+start
+            LD      HL, PARAMS
+            LD      A, $00
+            LD      B, $20
+
+cp_loop
+            LD      (HL), A         ; clear sample parameters
+            INC     HL
+            DJNZ    cp_loop
+
+            LD      HL, WAVBUFFER0
+            LD      A, $00
+            LD      B, $00          ; for 256 * 2 bytes to clear
+
+cb_loop
+            LD      (HL), A         ; initialize buffers to silent
+            INC     HL
+            LD      (HL), A
+            INC     HL
+            DJNZ    cb_loop
+
+            CALL    initDAC         ; prepare DAC for output
+
+            LD      HL, WAVBUFFER0  ; initialize write and read buffer
+            LD      (WRITEBUF), HL
+            LD      HL, WAVBUFFER1
+            LD      (READBUF), HL
+
+            LD      BC, HL          ; BC' point to read buffer
+            LD      D, $80          ; D' = $80 (fast unsign)
+            LD      HL, YMPORT1     ; HL' point to YMPORT1
+            EXX
+
+wait_nullwav
+            LD      HL, (NULLWAVADR)
+            LD      A, H
+            OR      L
+            JP      Z, wait_nullwav ; wait for null wav address being initialised
+            LD      HL, (NULLWAVLEN)
+            LD      A, H
+            OR      L
+            JP      Z, wait_nullwav ; wait for null wav len being initialised
+
+            stopChannel             ; stop channel
+
+            LD      A, STATREADY
+            LD      (STATUS), A     ; driver ready
+
+main_loop
+
+; channel 0
+; ---------
+
+; $00-$03
+            handlePlayCommandWhilePlay4 ;                       ' 440   | 440 (4*110)
+
+; $04-$07
+            prepareChannelWhilePlay4    ;                       ' 402   |
+            LD      C, 128              ; prepare loop counter  ' 7     | 440 (4*110)
+            wait31                      ;                       ' 4     |
+
+; $08-$87
+loop_ch
+            sampleOutputAndWait         ;                       ' 48    |
+            readAndWrite2               ; process 2  samples    ' 34    |
+            wait14                      ; synchro               ' 14    | 110
+            DEC     C                   ;                       ' 4     |
+            JP      NZ, loop_ch         ;                       ' 10    |
+
+; $88-$89
+            updateChannelDataWhilePlay2 ;                       ' 180   | 220 (2*110)
+            wait40                      ;                       ' 40    |
+
+; $8A-$8D
+            checkChannelEndWhilePlay4   ;                       ' 430   | 440 (4*110)
+            wait10                      ;                       ' 10    |
+
+
+; free time here
+; --------------
+
+; $8E
+            sampleOutputAndWait         ;                       ' 48    |
+            LD      C, $6F              ; prepare loop          ' 7     | 110
+            LD      HL, YMPORT0         ; and DAC set           ' 10    |
+            wait45                      ;                       ' 45    |
+
+; $8F-FD
+loop_freetime
+            sampleOutputAndWait         ;                       ' 48    |
+            wait48                      ;                       ' 48    | 110
+            DEC     C                   ;                       ' 4     |
+            JP      NZ, loop_freetime   ;                       ' 10    |
+
+; $FE-$FF
+            swapBufferWhilePlay2        ;                       ' 174   |
+            EXX                         ;                       ' 4     |
+            LD      BC, (READBUF)       ; read buffer           ' 20    | 220
+            EXX                         ;                       ' 4     |
+            wait8                       ;                       ' 8     |
+            JP      main_loop           ;                       ' 10    |
+
+
+; ########################### function #############################
+
+; initDAC
+; -----------
+; HL <-  YMPORT0
+; DE <-  $2A80
+;
+; prepare DAC for output
+
+initDAC
+            LD      DE, $2B80
+            CALL    writeYM0        ; enable DAC
+            LD      DE, $2A80
+            CALL    writeYM0        ; DAC data to silent
+            RET
+
+; writeYM0 / writeYM1
+; -------------------
+; D   -> address
+; E   -> value
+; HL <-  YMPORT0 / YMPORT2
+;
+; write to YM2612 (safe)
+; 81 cycles
+
+writeYM0                            ;                           ' 17
+            LD      HL, YMPORT0     ; HL = YM port 0            ' 10    | (27)
+
+.wait
+            BIT     7, (HL)         ; test YM not busy          ' 12    |
+            JR      NZ, .wait       ;                           ' 7     | 19 (46)
+
+            LD      L, $0           ; HL = YM port 0            ' 7     |
+            LD      (HL), D         ; write address             ' 7     |
+            INC     L               ; next port                 ' 4     | 25 (71)
+            LD      (HL), E         ; write value               ' 7     |
+
+            RET                     ; end                       ' 10    | (81)
+
+
+writeYM1                            ;                           ' 17
+            LD      HL, YMPORT0     ; HL = YM port 0            ' 10    | (27)
+
+.wait
+            BIT     7, (HL)         ; test YM not busy          ' 12    |
+            JR      NZ, .wait       ;                           ' 7     | 19 (46)
+
+            LD      L, $2           ; HL = YM port 2            ' 7     |
+            LD      (HL), D         ; write address             ' 7     | 25 (71)
+            INC     L               ; HL = YM port 3            ' 4     |
+            LD      (HL), E         ; write value               ' 7     |
+
+            RET                     ; end                       ' 10    | (81)
+
+
+; writeYM0Fast / writeYM1Fast
+; ---------------------------
+; D   -> address
+; E   -> value
+; HL <-  YMPORT0 / YMPORT2
+;
+; write to YM2612
+; 55 cycles
+
+writeYM0Fast                        ;                           ' 17
+
+            LD      HL, YMPORT0     ; HL = YM port 0            ' 10    |
+            LD      (HL), D         ; write address             ' 7     |
+            INC     L               ; next port                 ' 4     | 28 (45)
+            LD      (HL), E         ; write value               ' 7     |
+
+            RET                     ; end                       ' 10    | (55)
+
+
+writeYM1Fast                        ;                           ' 17
+
+            LD      HL, YMPORT2     ; HL = YM port 2            ' 10    |
+            LD      (HL), D         ; write address             ' 7     |
+            INC     L               ; next port                 ' 4     | 28 (45)
+            LD      (HL), E         ; write value               ' 7     |
+
+            RET                     ; end                       ' 10    | (55)
+
+
+
+            END
