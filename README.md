@@ -3,7 +3,23 @@
 Pink ones are coming down
 
 
-Someone will complain if I don't include a license so have this one.
+### Build
+
+From a fresh install of Debian Bookworm
+
+    sudo apt install git build-essential texinfo wget
+    git clone git@github.com:andwn/marsdev
+    cd marsdev
+    make m68k-toolchain
+    sudo make install
+    cd ..
+    git clone git@github.com:andwn/monsquaz-md
+    cd monsquaz-md
+    source /opt/toolchains/mars/mars.sh
+    make
+
+
+#### License (zlib)
 
 Copyright (c) 2024 andwn
 
